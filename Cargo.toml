@@ -1,7 +1,13 @@
 [package]
 name = "hexview"
 version = "0.1.0"
+authors = ["Terts Diepraam"]
 edition = "2021"
+rust-version = "1.78"
+description = "A TUI Hex viewer"
+repository = "https://github.com/tertsdiepraam/hexview"
+license = "MIT OR Apache-2.0"
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4.5.9", features = ["derive"] }
