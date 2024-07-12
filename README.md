@@ -1,6 +1,17 @@
 # Hexview
 
+<p>
+    <a href="https://crates.io/crates/hexview"><img src="https://img.shields.io/crates/v/hexview.svg?colorB=319e8c" alt="Version info"></a><br>
+    <img src="https://img.shields.io/crates/l/hexview.svg" alt="license">
+</p>
+
 A TUI Hex viewer written in Rust.
+
+# Installation
+
+```
+cargo install hexview
+```
 
 ## License
 
