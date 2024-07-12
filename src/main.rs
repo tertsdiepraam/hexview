@@ -12,14 +12,14 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
-            MouseEvent, MouseEventKind,
+            MouseButton, MouseEvent, MouseEventKind,
         },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     },
     layout::{
         Constraint::{Length, Min},
-        Layout, Margin, Rect,
+        Layout, Margin, Position, Rect,
     },
     style::{Color, Style, Stylize},
     terminal::{Frame, Terminal},
@@ -30,11 +30,15 @@ use ratatui::{
     },
 };
 
-/// A TUI hexadecimal data viewer
 #[derive(Parser)]
 #[command(version, author, about, long_about = None)]
 struct Args {
+    /// The file to view
     file: PathBuf,
+    #[arg(short, long, default_value_t = 8)]
+    bytes: usize,
+    #[arg(short, long, default_value_t = 2)]
+    groups: usize,
 }
 
 #[derive(PartialEq, Eq)]
@@ -55,7 +59,9 @@ struct App {
     goto_buffer: EditBuffer,
     help_popup: bool,
     show_inspector: bool,
-    lines_displayed: usize,
+    hex_area: Rect,
+    bytes_per_group: usize,
+    groups: usize,
 }
 
 impl App {
@@ -70,7 +76,10 @@ impl App {
     }
 
     fn scroll(&mut self, lines: isize) {
-        self.set_view(self.view.saturating_add_signed(lines * 16))
+        self.set_view(
+            self.view
+                .saturating_add_signed(lines * self.bytes_per_line() as isize),
+        )
     }
 
     fn scroll_and_move_cursor(&mut self, lines: isize) {
@@ -80,21 +89,30 @@ impl App {
         self.move_cursor(diff);
     }
 
+    fn bytes_per_line(&self) -> usize {
+        self.bytes_per_group * self.groups
+    }
+
     fn set_view(&mut self, offset: usize) {
         self.view = offset.min(self.buffer.len());
-        self.view -= self.view % 16;
+        self.view -= self.view % self.bytes_per_line();
+    }
+
+    fn lines_displayed(&self) -> usize {
+        self.hex_area.height as usize
     }
 
     fn scroll_to_cursor(&mut self) {
         if self.cursor < self.view {
             self.view = self.cursor_line_offset();
-        } else if self.cursor > self.view + (16 * self.lines_displayed) {
-            self.view = self.cursor_line_offset() - 16 * (self.lines_displayed - 1);
+        } else if self.cursor >= self.view + (self.bytes_per_line() * self.lines_displayed()) {
+            self.view =
+                self.cursor_line_offset() - self.bytes_per_line() * (self.lines_displayed());
         }
     }
 
     fn cursor_line_offset(&self) -> usize {
-        self.cursor - (self.cursor % 16)
+        self.cursor - (self.cursor % self.bytes_per_line())
     }
 
     fn find(&mut self, pattern: &[u8]) {
@@ -174,12 +192,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let app = App {
         view: 0,
         cursor: 0,
+        bytes_per_group: args.bytes,
+        groups: args.groups,
         buffer,
         current_search_buffer: None,
         path: args.file,
         help_popup: false,
         show_inspector: false,
-        lines_displayed: terminal.size().unwrap().height as usize - 4,
+        hex_area: Rect::new(0, 0, 0, 0),
         hex_search_buffer: EditBuffer::new("Hex Search", |buf, app| {
             if !buf
                 .buffer
@@ -262,19 +282,19 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             // Now we do our normal event handling
             if let Event::Key(key) = event {
                 if key.code == KeyCode::Up {
-                    app.move_cursor(-16);
+                    app.move_cursor(-(app.bytes_per_line() as isize));
                 }
 
                 if key.code == KeyCode::Down {
-                    app.move_cursor(16);
+                    app.move_cursor(app.bytes_per_line() as isize);
                 }
 
                 if key.code == KeyCode::PageDown {
-                    app.scroll_and_move_cursor(app.lines_displayed as isize);
+                    app.scroll_and_move_cursor(app.lines_displayed() as isize);
                 }
 
                 if key.code == KeyCode::PageUp {
-                    app.scroll_and_move_cursor(-(app.lines_displayed as isize));
+                    app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
                 }
 
                 if let Some(buf) = app.current_buffer_mut() {
@@ -328,10 +348,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                         return Ok(());
                     }
                     if key.code == KeyCode::Char('j') {
-                        app.move_cursor(16);
+                        app.move_cursor(app.bytes_per_line() as isize);
                     }
                     if key.code == KeyCode::Char('k') {
-                        app.move_cursor(-16);
+                        app.move_cursor(-(app.bytes_per_line() as isize));
                     }
                     if key.code == KeyCode::Char('h') {
                         app.move_cursor(-1);
@@ -354,10 +374,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 }
 
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-                    app.scroll_and_move_cursor(app.lines_displayed as isize);
+                    app.scroll_and_move_cursor(app.lines_displayed() as isize);
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-                    app.scroll_and_move_cursor(-(app.lines_displayed as isize));
+                    app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
                 }
                 if key.code == KeyCode::Char('?') {
                     app.help_popup = true;
@@ -382,6 +402,20 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
             {
                 app.scroll(-1);
             }
+
+            if let Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: _,
+            }) = event
+            {
+                if app.hex_area.contains(Position::new(column, row)) {
+                    let x = (column - app.hex_area.x - 8) / 3;
+                    let y = row - app.hex_area.y;
+                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize);
+                }
+            }
         }
     }
 }
@@ -399,8 +433,15 @@ fn ui(app: &mut App, frame: &mut Frame) {
         app.path.display(),
     ));
 
+    let hex_width = 2 // borders
+        + 8 // offset
+        + (3 * app.bytes_per_group * app.groups); // bytes
+
+    let ascii_width = 2 + (app.bytes_per_group * app.groups);
+    let width = hex_width + ascii_width + 1; // scrollbar
+
     let mut frame_size = frame.size();
-    frame_size.width = frame_size.width.min(80);
+    frame_size.width = frame_size.width.min(width as u16);
 
     frame.render_widget(&main_block, frame_size);
     let main = main_block.inner(frame_size);
@@ -450,8 +491,13 @@ fn ui(app: &mut App, frame: &mut Frame) {
         frame.render_widget(&inspector_text, inspector_block.inner(inspector_area));
     }
 
-    let [hex_area, ascii_area, scrollbar_area, _] =
-        Layout::horizontal([Length(61), Length(18), Length(1), Min(0)]).areas(top_area);
+    let [hex_area, ascii_area, scrollbar_area, _] = Layout::horizontal([
+        Length(hex_width as u16),
+        Length(ascii_width as u16),
+        Length(1),
+        Min(0),
+    ])
+    .areas(top_area);
 
     let block = Block::new()
         .title("HEX")
@@ -469,7 +515,6 @@ fn ui(app: &mut App, frame: &mut Frame) {
     frame.render_widget(&block, ascii_area);
     let ascii_area = block.inner(ascii_area);
 
-    const BYTES_PER_LINE: usize = 16;
     let lines_to_draw = hex_area.height as usize;
 
     let mut scrollbar_state = ScrollbarState::new(app.buffer.len())
@@ -483,7 +528,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     let mut lines = Vec::new();
     'outer: for i in 0..lines_to_draw {
-        let line_offset = app.view + i * BYTES_PER_LINE;
+        let line_offset = app.view + i * app.bytes_per_line();
 
         // Write the offset at the start of the line
         let mut spans = Vec::new();
@@ -494,9 +539,9 @@ fn ui(app: &mut App, frame: &mut Frame) {
         ));
         spans.push(Span::raw(offset_string));
 
-        for byte_offset in line_offset..(line_offset + BYTES_PER_LINE) {
-            if byte_offset % 8 == 0 {
-                spans.push(Span::raw("  "));
+        for byte_offset in line_offset..(line_offset + app.bytes_per_line()) {
+            if byte_offset % app.bytes_per_group == 0 {
+                spans.push("│".fg(Color::DarkGray));
             } else {
                 spans.push(Span::raw(" "));
             }
@@ -514,15 +559,15 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     frame.render_widget(Paragraph::new(Text::from(lines)), hex_area);
 
-    app.lines_displayed = hex_area.height as usize;
+    app.hex_area = hex_area;
 
     let mut lines = Vec::new();
     'outer: for i in 0..lines_to_draw {
         // Write the offset at the start of the line
-        let line_offset = app.view + i * BYTES_PER_LINE;
+        let line_offset = app.view + i * app.bytes_per_line();
 
         let mut spans = Vec::new();
-        for byte_offset in line_offset..(line_offset + BYTES_PER_LINE) {
+        for byte_offset in line_offset..(line_offset + app.bytes_per_line()) {
             match app.buffer.get(byte_offset) {
                 Some(byte) => spans.push(render_ascii_char(app, byte_offset, *byte)),
                 None => {
