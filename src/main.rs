@@ -30,7 +30,9 @@ use ratatui::{
     },
 };
 
+/// A TUI hexadecimal data viewer
 #[derive(Parser)]
+#[command(version, author, about, long_about = None)]
 struct Args {
     file: PathBuf,
 }
