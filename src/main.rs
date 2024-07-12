@@ -545,8 +545,10 @@ fn ui(app: &mut App, frame: &mut Frame) {
         let keys = vec![
             (vec!["?"], "Toggle help"),
             (vec!["Q", "CTRL+C"], "Quit"),
-            (vec!["UP", "K"], "Line up"),
-            (vec!["UP", "J"], "Line down"),
+            (vec!["UP", "K"], "Move cursor up"),
+            (vec!["DOWN", "J"], "Move cursor down"),
+            (vec!["LEFT", "H"], "Move cursor left"),
+            (vec!["RIGHT", "L"], "Move cursor right"),
             (vec!["PAGE UP", "CTRL+U"], "Page up"),
             (vec!["PAGE DOWN", "CTRL+D"], "Page down"),
             (vec!["G"], "Goto offset"),
