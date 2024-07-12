@@ -319,11 +319,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     if key.code == KeyCode::Right {
                         app.move_cursor(1);
                     }
-
                     if key.code == KeyCode::Left {
                         app.move_cursor(-1);
                     }
-
                     if key.code == KeyCode::Char('q') {
                         return Ok(());
                     }
@@ -554,6 +552,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
             (vec!["G"], "Goto offset"),
             (vec!["S"], "Search ASCII string"),
             (vec!["/"], "Search HEX string"),
+            (vec!["I"], "Toggle inspector"),
         ];
 
         let table = Table::new(
