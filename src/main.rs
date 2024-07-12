@@ -348,6 +348,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     if key.code == KeyCode::Char('/') {
                         app.current_search_buffer = Some(SearchBuffer::HexSearch);
                     }
+                    if key.code == KeyCode::Char('i') {
+                        app.show_inspector = !app.show_inspector;
+                    }
                 }
 
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
@@ -361,9 +364,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 }
                 if key.code == KeyCode::Esc {
                     app.current_search_buffer = None;
-                }
-                if key.code == KeyCode::Char('i') {
-                    app.show_inspector = !app.show_inspector;
                 }
             }
 
@@ -405,13 +405,14 @@ fn ui(app: &mut App, frame: &mut Frame) {
     frame.render_widget(&main_block, frame_size);
     let main = main_block.inner(frame_size);
 
-    let [top_area, bottom_area] = Layout::vertical([
+    let [top_area, bottom_area, inspector_area] = Layout::vertical([
         Min(0),
         Length(if app.current_search_buffer.is_some() {
             3
         } else {
             0
         }),
+        Length(if app.show_inspector { 7 } else { 0 }),
     ])
     .areas(main);
 
@@ -423,6 +424,30 @@ fn ui(app: &mut App, frame: &mut Frame) {
         frame.render_widget(&text, search_area);
         let x = search_area.x + buf.cursor_position as u16;
         frame.set_cursor(x, search_area.y);
+    }
+
+    if app.show_inspector {
+        let inspector_block = Block::bordered().title("Inspector (press `I` to hide)");
+        let x = app.buffer[app.cursor];
+        let x8 = u8::from_le_bytes(chunk(&app.buffer, app.cursor));
+        let x16 = u16::from_le_bytes(chunk(&app.buffer, app.cursor));
+        let x32 = u32::from_le_bytes(chunk(&app.buffer, app.cursor));
+        let x64 = u64::from_le_bytes(chunk(&app.buffer, app.cursor));
+        let inspector_text = Paragraph::new(vec![
+            Line::from(format!("Hex: {x:>2x}, Oct: {x:>3o}, Dec: {x:>3}")),
+            Line::from(format!(
+                "u8: {}, u16: {}, u32: {}, u64: {}",
+                x8, x16, x32, x64
+            )),
+            Line::from(format!(
+                "i8: {}, i16: {}, i32: {}, i64: {}",
+                x8 as i8, x16 as i16, x32 as i32, x64 as i64
+            )),
+            Line::from(format!("f32: {}", f32::from_bits(x32),)),
+            Line::from(format!("f64: {}", f64::from_bits(x64),)),
+        ]);
+        frame.render_widget(&inspector_block, inspector_area);
+        frame.render_widget(&inspector_text, inspector_block.inner(inspector_area));
     }
 
     let [hex_area, ascii_area, scrollbar_area, _] =
@@ -499,7 +524,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
         let mut spans = Vec::new();
         for byte_offset in line_offset..(line_offset + BYTES_PER_LINE) {
             match app.buffer.get(byte_offset) {
-                Some(byte) => spans.push(render_ascii_char(*byte)),
+                Some(byte) => spans.push(render_ascii_char(app, byte_offset, *byte)),
                 None => {
                     lines.push(Line::from(spans));
                     break 'outer;
@@ -589,15 +614,19 @@ fn write_byte(app: &App, offset: usize, byte: u8) -> Span<'static> {
     Span::styled(s, style)
 }
 
-fn render_ascii_char(byte: u8) -> Span<'static> {
+fn render_ascii_char(app: &App, offset: usize, byte: u8) -> Span<'static> {
     let c = match byte {
         0..=31 => '.',
         byte @ (b' '..=b'~') => byte as char,
         127 => '.',
         128..=u8::MAX => '.',
     };
-    let color = byte_color(byte);
-    Span::styled(String::from(c), Style::default().fg(color))
+    let style = if app.cursor == offset {
+        Style::default().fg(Color::White).bold().underlined()
+    } else {
+        Style::default().fg(byte_color(byte))
+    };
+    Span::styled(String::from(c), style)
 }
 
 /// helper function to create a centered rect using up certain percentage of the available rect `r`
@@ -605,4 +634,14 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
     let popup_layout = Layout::vertical([Min(0), Length(height), Min(0)]).split(r);
 
     Layout::horizontal([Min(0), Length(width), Min(0)]).split(popup_layout[1])[1]
+}
+
+fn chunk<const N: usize>(arr: &[u8], offset: usize) -> [u8; N]
+where
+    [u8; N]: Default,
+{
+    match arr[offset..].first_chunk::<N>() {
+        Some(chunk) => *chunk,
+        None => Default::default(),
+    }
 }
