@@ -60,6 +60,7 @@ struct App {
     help_popup: bool,
     show_inspector: bool,
     hex_area: Rect,
+    ascii_area: Rect,
     bytes_per_group: usize,
     groups: usize,
 }
@@ -200,6 +201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         help_popup: false,
         show_inspector: false,
         hex_area: Rect::new(0, 0, 0, 0),
+        ascii_area: Rect::new(0, 0, 0, 0),
         hex_search_buffer: EditBuffer::new("Hex Search", |buf, app| {
             if !buf
                 .buffer
@@ -415,6 +417,11 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     let y = row - app.hex_area.y;
                     app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize);
                 }
+                if app.ascii_area.contains(Position::new(column, row)) {
+                    let x = column - app.ascii_area.x;
+                    let y = row - app.ascii_area.y;
+                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize);
+                }
             }
         }
     }
@@ -515,6 +522,10 @@ fn ui(app: &mut App, frame: &mut Frame) {
     frame.render_widget(&block, ascii_area);
     let ascii_area = block.inner(ascii_area);
 
+    // Store the rects to properly handle mouse input
+    app.hex_area = hex_area;
+    app.ascii_area = ascii_area;
+
     let lines_to_draw = hex_area.height as usize;
 
     let mut scrollbar_state = ScrollbarState::new(app.buffer.len())
@@ -558,8 +569,6 @@ fn ui(app: &mut App, frame: &mut Frame) {
     }
 
     frame.render_widget(Paragraph::new(Text::from(lines)), hex_area);
-
-    app.hex_area = hex_area;
 
     let mut lines = Vec::new();
     'outer: for i in 0..lines_to_draw {
