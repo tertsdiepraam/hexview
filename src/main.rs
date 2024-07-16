@@ -12,7 +12,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers,
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
             MouseButton, MouseEvent, MouseEventKind,
         },
         execute,
@@ -405,18 +405,23 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
     };
 
     // We always allow quitting with ctrl+c
-    if let Event::Key(key) = event {
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-            return ControlFlow::Break(());
-        }
+    if let Event::Key(KeyEvent {
+        code: KeyCode::Char('c'),
+        modifiers: KeyModifiers::CONTROL,
+        ..
+    }) = event
+    {
+        return ControlFlow::Break(());
     }
 
     // The help popup takes precedence over everything else
     if app.help_popup {
-        if let Event::Key(key) = event {
-            if let KeyCode::Char('?' | 'q') | KeyCode::Esc = key.code {
-                app.help_popup = false;
-            }
+        if let Event::Key(KeyEvent {
+            code: KeyCode::Char('?' | 'q') | KeyCode::Esc | KeyCode::Enter,
+            ..
+        }) = event
+        {
+            app.help_popup = false;
         }
         // We ignore everything until the popup is gone
         return ControlFlow::Continue(());
@@ -424,205 +429,196 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
 
     // Now we do our normal event handling
     if let Event::Key(key) = event {
-        if key.code == KeyCode::Up {
-            if key.modifiers == KeyModifiers::CONTROL {
+        let shift = key.modifiers == KeyModifiers::SHIFT;
+        let control = key.modifiers == KeyModifiers::CONTROL;
+
+        match key.code {
+            KeyCode::Up if control => {
                 app.scroll(-1);
-            } else {
+            }
+            KeyCode::Up => {
                 app.move_cursor(-(app.bytes_per_line() as isize));
             }
-        }
-
-        if key.code == KeyCode::Down {
-            if key.modifiers == KeyModifiers::CONTROL {
+            KeyCode::Down if control => {
                 app.scroll(1);
-            } else {
+            }
+            KeyCode::Down => {
                 app.move_cursor(app.bytes_per_line() as isize);
             }
-        }
-
-        if key.code == KeyCode::PageDown {
-            app.scroll_and_move_cursor(app.lines_displayed() as isize);
-        }
-
-        if key.code == KeyCode::PageUp {
-            app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
+            KeyCode::PageDown => {
+                app.scroll_and_move_cursor(app.lines_displayed() as isize);
+            }
+            KeyCode::PageUp => {
+                app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
+            }
+            KeyCode::Char('d') if control => {
+                app.scroll_and_move_cursor(app.lines_displayed() as isize);
+            }
+            KeyCode::Char('u') if control => {
+                app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
+            }
+            KeyCode::Esc => {
+                app.current_search_buffer = None;
+            }
+            _ => {}
         }
 
         if let Some(buf) = app.current_buffer_mut() {
-            if key.code == KeyCode::Right {
-                buf.cursor_position += 1;
-                buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
-            }
-
-            if key.code == KeyCode::Left {
-                buf.cursor_position = buf.cursor_position.saturating_sub(1);
-            }
-
-            if let KeyCode::Char(c) = key.code {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Right => {
+                    buf.cursor_position += 1;
+                    buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
+                }
+                KeyCode::Left => {
+                    buf.cursor_position = buf.cursor_position.saturating_sub(1);
+                }
+                // Only Shift can be pressed for a character to be recognized
+                KeyCode::Char(c) if shift || key.modifiers.is_empty() => {
                     buf.buffer.insert(buf.cursor_position, c);
                     buf.cursor_position += 1;
                 }
-            }
-
-            if key.code == KeyCode::Home {
-                buf.cursor_position = 0;
-            }
-
-            if key.code == KeyCode::End {
-                buf.cursor_position = buf.buffer.len();
-            }
-
-            if key.code == KeyCode::Backspace && buf.cursor_position > 0 {
-                buf.buffer.remove(buf.cursor_position - 1);
-                buf.cursor_position = buf.cursor_position.saturating_sub(1);
-                buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
-            }
-
-            if key.code == KeyCode::Delete && buf.cursor_position < buf.buffer.len() {
-                buf.buffer.remove(buf.cursor_position);
-            }
-
-            if key.code == KeyCode::Enter {
-                let action = buf.action.clone();
-                (app.search_str_len, app.positions) = (action)(buf, &haystack, search_alignment_bytes);
-
-                if !app.positions.is_empty() {
-                    let i = match app.positions.binary_search(&app.cursor.0) {
-                        Ok(i) | Err(i) => i,
-                    };
-                    let i = i % app.positions.len();
-                    app.occurrence = i + 1;
-                    app.set_cursor(app.positions[i], app.search_str_len)
+                KeyCode::Home => {
+                    buf.cursor_position = 0;
                 }
-                app.current_search_buffer = None;
-            }
+                KeyCode::End => {
+                    buf.cursor_position = buf.buffer.len();
+                }
+                // 'h' is backspace with control for inexplicable reasons
+                KeyCode::Backspace | KeyCode::Char('h') if control => {
+                    buf.buffer.clear();
+                    buf.cursor_position = 0;
+                }
+                KeyCode::Backspace if buf.cursor_position > 0 => {
+                    buf.buffer.remove(buf.cursor_position - 1);
+                    buf.cursor_position = buf.cursor_position.saturating_sub(1);
+                    buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
+                }
+                KeyCode::Delete if buf.cursor_position < buf.buffer.len() => {
+                    buf.buffer.remove(buf.cursor_position);
+                }
+                KeyCode::Enter => {
+                    let action = buf.action.clone();
+                    (app.search_str_len, app.positions) =
+                        (action)(buf, &haystack, search_alignment_bytes);
 
-            if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
-                app.search_aligned = !app.search_aligned;
+                    if !app.positions.is_empty() {
+                        let i = match app.positions.binary_search(&app.cursor.0) {
+                            Ok(i) | Err(i) => i,
+                        };
+                        let i = i % app.positions.len();
+                        app.occurrence = i + 1;
+                        app.set_cursor(app.positions[i], app.search_str_len)
+                    }
+                    app.current_search_buffer = None;
+                }
+                KeyCode::Char('a') if control => {
+                    app.search_aligned = !app.search_aligned;
+                }
+                _ => {}
             }
         }
 
         // Vim-like controls when not typing in a buffer
         if app.current_search_buffer.is_none() {
-            let bytes = app.alignment.bytes(app.cursor.1) as isize;
-            if key.code == KeyCode::Right {
-                if key.modifiers == KeyModifiers::SHIFT {
+            match key.code {
+                KeyCode::Right if shift => {
                     app.cursor.1 += 1;
-                } else if key.modifiers == KeyModifiers::CONTROL {
-                    app.move_cursor(bytes);
-                } else {
+                }
+                KeyCode::Right if control => {
+                    app.move_cursor(alignment_bytes as isize);
+                }
+                KeyCode::Right => {
                     app.move_cursor(1);
                 }
-            }
-            if key.code == KeyCode::Left {
-                if key.modifiers == KeyModifiers::SHIFT {
+                KeyCode::Left if shift => {
                     app.cursor.1 = app.cursor.1.saturating_sub(1).max(1);
-                } else if key.modifiers == KeyModifiers::CONTROL {
-                    app.move_cursor(-bytes);
-                } else {
+                }
+                KeyCode::Left if control => {
+                    app.move_cursor(-(alignment_bytes as isize));
+                }
+                KeyCode::Left => {
                     app.move_cursor(-1);
                 }
-            }
-            if key.code == KeyCode::Char('q') {
-                return ControlFlow::Break(());
-            }
-            if key.code == KeyCode::Char('j') {
-                app.move_cursor(app.bytes_per_line() as isize);
-            }
-            if key.code == KeyCode::Char('k') {
-                app.move_cursor(-(app.bytes_per_line() as isize));
-            }
-            if key.code == KeyCode::Char('h') {
-                app.move_cursor(-1);
-            }
-            if key.code == KeyCode::Char('l') {
-                app.move_cursor(1);
-            }
-            if key.code == KeyCode::Char('g') {
-                app.current_search_buffer = Some(SearchBufferType::Goto);
-            }
-            if key.code == KeyCode::Char('s') {
-                app.current_search_buffer = Some(SearchBufferType::AsciiSearch);
-            }
-            if key.code == KeyCode::Char('/') {
-                app.current_search_buffer = Some(SearchBufferType::HexSearch);
-            }
-            if key.code == KeyCode::Char('i') {
-                app.show_inspector = !app.show_inspector;
-            }
-            if key.code == KeyCode::Char('?') {
-                app.help_popup = true;
-            }
-            if key.code == KeyCode::Char(';') {
-                app.cursor.1 = 1;
-            }
-            if let KeyCode::Char('n' | 'N') = key.code {
-                if !app.positions.is_empty() {
+                KeyCode::Char('q') => {
+                    return ControlFlow::Break(());
+                }
+                KeyCode::Char('j') => {
+                    app.move_cursor(app.bytes_per_line() as isize);
+                }
+                KeyCode::Char('k') => {
+                    app.move_cursor(-(app.bytes_per_line() as isize));
+                }
+                KeyCode::Char('h') => {
+                    app.move_cursor(-1);
+                }
+                KeyCode::Char('l') => {
+                    app.move_cursor(1);
+                }
+                KeyCode::Char('g') => {
+                    app.current_search_buffer = Some(SearchBufferType::Goto);
+                }
+                KeyCode::Char('s') => {
+                    app.current_search_buffer = Some(SearchBufferType::AsciiSearch);
+                }
+                KeyCode::Char('/') => {
+                    app.current_search_buffer = Some(SearchBufferType::HexSearch);
+                }
+                KeyCode::Char('i') => {
+                    app.show_inspector = !app.show_inspector;
+                }
+                KeyCode::Char('?') => {
+                    app.help_popup = true;
+                }
+                KeyCode::Char(';') => {
+                    app.cursor.1 = 1;
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Enter if !app.positions.is_empty() => {
                     let res = app.positions.binary_search(&app.cursor.0);
-                    let i = if key.modifiers == KeyModifiers::SHIFT {
+                    let i = if shift {
                         match res {
                             Ok(i) | Err(i) => i + app.positions.len() - 1,
                         }
                     } else {
                         match res {
-                            Ok(i) => i,
-                            Err(i) => i + 1,
+                            Ok(i) => i + 1,
+                            Err(i) => i,
                         }
                     };
                     let i = i % app.positions.len();
                     app.occurrence = i + 1;
                     app.set_cursor(app.positions[i], app.search_str_len);
                 }
+                KeyCode::Char('a') if control => {
+                    app.alignment = app.alignment.next();
+                }
+                _ => {}
             }
-            if key.code == KeyCode::Char('a') && key.modifiers == KeyModifiers::CONTROL {
-                app.alignment = app.alignment.next();
-            }
-        }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-            app.scroll_and_move_cursor(app.lines_displayed() as isize);
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
-            app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
-        }
-        if key.code == KeyCode::Esc {
-            app.current_search_buffer = None;
         }
     }
 
     if let Event::Mouse(MouseEvent {
-        kind: MouseEventKind::ScrollDown,
-        ..
-    }) = event
-    {
-        app.scroll(1);
-    }
-
-    if let Event::Mouse(MouseEvent {
-        kind: MouseEventKind::ScrollUp,
-        ..
-    }) = event
-    {
-        app.scroll(-1);
-    }
-
-    if let Event::Mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
+        kind,
         column,
         row,
         modifiers: _,
     }) = event
     {
-        if app.hex_area.contains(Position::new(column, row)) {
-            let x = (column - app.hex_area.x - 8) / 3;
-            let y = row - app.hex_area.y;
-            app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
-        }
-        if app.ascii_area.contains(Position::new(column, row)) {
-            let x = column - app.ascii_area.x;
-            let y = row - app.ascii_area.y;
-            app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
+        match kind {
+            MouseEventKind::ScrollDown => app.scroll(1),
+            MouseEventKind::ScrollUp => app.scroll(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if app.hex_area.contains(Position::new(column, row)) {
+                    let x = (column - app.hex_area.x - 8) / 3;
+                    let y = row - app.hex_area.y;
+                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
+                }
+                if app.ascii_area.contains(Position::new(column, row)) {
+                    let x = column - app.ascii_area.x;
+                    let y = row - app.ascii_area.y;
+                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
+                }
+            }
+            _ => {}
         }
     }
 
