@@ -37,11 +37,14 @@ struct Args {
     /// The file to view
     file: PathBuf,
     #[arg(short, long, default_value_t = 8)]
+    /// The number of bytes per group
     bytes: usize,
     #[arg(short, long, default_value_t = 2)]
+    /// The number of groups (columns) to show
     groups: usize,
     #[arg(short, long, default_value_t = true)]
     color: bool,
+    /// Add a bit of additional padding
     #[arg(short, long, default_value_t = false)]
     spacing: bool,
 }
