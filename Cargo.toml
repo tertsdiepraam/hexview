@@ -13,3 +13,4 @@ categories = ["command-line-utilities"]
 clap = { version = "4.5.9", features = ["derive", "cargo"] }
 memchr = "2.7.4"
 ratatui = "0.27.0"
+tui-textarea = "0.5.1"

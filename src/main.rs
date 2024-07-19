@@ -1,13 +1,11 @@
 use std::{
-    error::Error,
-    io::{self, Read},
-    ops::ControlFlow,
-    path::PathBuf,
-    rc::Rc,
-    time::Duration,
+    error::Error, io::{self, Read}, num::NonZeroUsize, ops::ControlFlow, path::PathBuf, time::Duration
 };
 
+use alignment::Alignment;
 use clap::Parser;
+use data_type::Endianness;
+use goto::Goto;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
@@ -30,10 +28,17 @@ use ratatui::{
         ScrollbarState, Table,
     },
 };
+use search::Search;
+
+mod alignment;
+mod data_type;
+mod goto;
+mod line_editor;
+mod search;
 
 #[derive(Parser)]
 #[command(version, author, about, long_about = None)]
-struct Args {
+pub struct Args {
     /// The file to view
     file: PathBuf,
     #[arg(short, long, default_value_t = 8)]
@@ -49,14 +54,8 @@ struct Args {
     spacing: bool,
 }
 
-#[derive(PartialEq, Eq)]
-enum SearchBufferType {
-    HexSearch,
-    AsciiSearch,
-    Goto,
-}
-
-struct App {
+#[derive(Default)]
+pub struct AppState<'a> {
     /// Offset of the byte in the top-left corner
     view: usize,
     /// Whether to render with some additional padding
@@ -64,29 +63,70 @@ struct App {
     /// Whether to enable colors
     color: bool,
     /// Position and length of the cursor
-    cursor: (usize, usize),
-    buffer: Rc<Vec<u8>>,
+    cursor: Cursor,
+    buffer: &'a [u8],
     path: PathBuf,
-    search_str_len: usize,
+    searched: Vec<u8>,
     /// Last occurrence we jumped to
     occurrence: usize,
-    /// Whether to restrict search to aligned sequences
-    search_aligned: bool,
-    positions: Vec<usize>,
+    occurrence_positions: Vec<usize>,
     alignment: Alignment,
-    current_search_buffer: Option<SearchBufferType>,
-    hex_search_buffer: SearchBuffer,
-    ascii_search_buffer: SearchBuffer,
-    goto_buffer: SearchBuffer,
     help_popup: bool,
     show_inspector: bool,
-    hex_area: Rect,
-    ascii_area: Rect,
     bytes_per_group: usize,
     groups: usize,
+    endianness: Endianness,
+    hex_area: Rect,
+    ascii_area: Rect,
 }
 
-impl App {
+#[derive(Default)]
+struct App<'a> {
+    state: AppState<'a>,
+    search: Search,
+    goto: Goto,
+}
+
+struct Cursor {
+    position: usize,
+    length: NonZeroUsize,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Cursor {
+            position: 0,
+            length: 1.try_into().unwrap(),
+        }
+    }
+}
+
+impl<'a> App<'a> {
+    fn new(buffer: &'a [u8], args: Args) -> Self {
+        let Args {
+            file: path,
+            bytes: bytes_per_group,
+            groups,
+            color,
+            spacing,
+        } = args;
+        App {
+            state: AppState {
+                path,
+                buffer,
+                spacing,
+                color,
+                bytes_per_group,
+                groups,
+                cursor: (0, 1),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+}
+
+impl AppState<'_> {
     fn move_cursor(&mut self, delta: isize) {
         let offset = self.cursor.0.saturating_add_signed(delta);
         self.set_cursor(offset, self.cursor.1)
@@ -117,12 +157,8 @@ impl App {
     }
 
     fn set_view(&mut self, offset: usize) {
-        self.view = offset.min(self.buffer.len());
-        self.view -= self.view % self.bytes_per_line();
-    }
-
-    fn lines_displayed(&self) -> usize {
-        self.hex_area.height as usize
+        let offset = offset.min(self.buffer.len());
+        self.view = self.line_offset(offset);
     }
 
     fn scroll_to_cursor(&mut self) {
@@ -136,106 +172,31 @@ impl App {
         }
     }
 
+    fn goto_occurrence(&mut self, previous: bool) {
+        if !self.occurrence_positions.is_empty() {
+            let res = self.occurrence_positions.binary_search(&self.cursor.0);
+            let i = if previous {
+                match res {
+                    Ok(i) | Err(i) => i + self.occurrence_positions.len() - 1,
+                }
+            } else {
+                match res {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                }
+            };
+            let i = i % self.occurrence_positions.len();
+            self.occurrence = i + 1;
+            self.set_cursor(self.occurrence_positions[i], self.searched.len());
+        }
+    }
+
     fn line_offset(&self, offset: usize) -> usize {
         offset - (offset % self.bytes_per_line())
     }
-}
 
-#[derive(Clone)]
-struct SearchBuffer {
-    buffer: Vec<char>,
-    cursor_position: usize,
-    name: &'static str,
-    placeholder_text: &'static str,
-    #[allow(clippy::type_complexity)]
-    action: Rc<dyn Fn(&mut SearchBuffer, &[u8], usize) -> (usize, Vec<usize>)>,
-}
-
-impl SearchBuffer {
-    fn new(
-        name: &'static str,
-        bottom_text: &'static str,
-        action: impl Fn(&mut SearchBuffer, &[u8], usize) -> (usize, Vec<usize>) + 'static,
-    ) -> SearchBuffer {
-        SearchBuffer {
-            buffer: Vec::new(),
-            cursor_position: 0,
-            name,
-            placeholder_text: bottom_text,
-            action: Rc::new(action),
-        }
-    }
-}
-
-impl App {
-    fn current_buffer(&self) -> Option<&SearchBuffer> {
-        match self.current_search_buffer {
-            None => None,
-            Some(SearchBufferType::HexSearch) => Some(&self.hex_search_buffer),
-            Some(SearchBufferType::AsciiSearch) => Some(&self.ascii_search_buffer),
-            Some(SearchBufferType::Goto) => Some(&self.goto_buffer),
-        }
-    }
-
-    fn current_buffer_mut(&mut self) -> Option<&mut SearchBuffer> {
-        match self.current_search_buffer {
-            None => None,
-            Some(SearchBufferType::HexSearch) => Some(&mut self.hex_search_buffer),
-            Some(SearchBufferType::AsciiSearch) => Some(&mut self.ascii_search_buffer),
-            Some(SearchBufferType::Goto) => Some(&mut self.goto_buffer),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Alignment {
-    B1,
-    B2,
-    B4,
-    B8,
-    B16,
-    Natural,
-}
-
-impl Alignment {
-    fn bytes(self, cursor_size: usize) -> usize {
-        match self {
-            Alignment::B1 => 1,
-            Alignment::B2 => 2,
-            Alignment::B4 => 4,
-            Alignment::B8 => 8,
-            Alignment::B16 => 16,
-            Alignment::Natural => cursor_size,
-        }
-    }
-
-    fn next(self) -> Self {
-        use Alignment::*;
-        match self {
-            B1 => B2,
-            B2 => B4,
-            B4 => B8,
-            B8 => B16,
-            B16 => Natural,
-            Natural => B1,
-        }
-    }
-}
-
-impl std::fmt::Display for Alignment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:>3}",
-            match self {
-                Alignment::B1 => "1",
-                Alignment::B2 => "2",
-                Alignment::B4 => "4",
-                Alignment::B8 => "8",
-                Alignment::B16 => "16",
-                Alignment::Natural => "NAT",
-            }
-        )
+    fn lines_displayed(&self) -> usize {
+        self.hex_area.height as usize
     }
 }
 
@@ -253,109 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app = App {
-        view: 0,
-        color: args.color,
-        spacing: args.spacing,
-        cursor: (0, 1),
-        occurrence: 0,
-        search_str_len: 0,
-        positions: Vec::new(),
-        bytes_per_group: args.bytes,
-        groups: args.groups,
-        buffer: Rc::new(buffer),
-        current_search_buffer: None,
-        search_aligned: false,
-        path: args.file,
-        help_popup: false,
-        show_inspector: false,
-        hex_area: Rect::new(0, 0, 0, 0),
-        ascii_area: Rect::new(0, 0, 0, 0),
-        alignment: Alignment::Natural,
-        hex_search_buffer: SearchBuffer::new(
-            "HEX SEARCH",
-            "Enter a byte pattern to search for",
-            |buf, haystack, alignment| {
-                if !buf
-                    .buffer
-                    .iter()
-                    .all(|c| c.is_ascii_hexdigit() || *c == ' ')
-                {
-                    return (0, Vec::new());
-                }
-
-                let chars: String = buf.buffer.iter().filter(|x| **x != ' ').collect();
-
-                if chars.len() % 2 > 0 {
-                    return (0, Vec::new());
-                }
-
-                let mut bytes: Vec<u8> = Vec::new();
-                for i in (0..chars.len()).step_by(2) {
-                    bytes.push(u8::from_str_radix(&chars[i..(i + 2)], 16).unwrap())
-                }
-
-                let vec = if alignment == 1 {
-                    memchr::memmem::find_iter(haystack, &bytes).collect()
-                } else {
-                    let mut vec = Vec::new();
-                    for i in (0..haystack.len()).step_by(alignment) {
-                        if haystack[i..].starts_with(&bytes) {
-                            vec.push(i);
-                        }
-                    }
-                    vec
-                };
-                (bytes.len(), vec)
-            },
-        ),
-        ascii_search_buffer: SearchBuffer::new(
-            "ASCII SEARCH",
-            "Enter a text string to search for",
-            |buf, haystack, alignment| {
-                let bytes = buf.buffer.iter().collect::<String>().into_bytes();
-                let vec = if alignment == 1 {
-                    memchr::memmem::find_iter(haystack, &bytes).collect()
-                } else {
-                    let mut vec = Vec::new();
-                    for i in (0..haystack.len()).step_by(alignment) {
-                        if haystack[i..].starts_with(&bytes) {
-                            vec.push(i);
-                        }
-                    }
-                    vec
-                };
-                (bytes.len(), vec)
-            },
-        ),
-        goto_buffer: SearchBuffer::new(
-            "GOTO",
-            "Go to an offset, or a percentage with '%'.",
-            |buf, haystack, _alignment| {
-                let s = buf.buffer.iter().collect::<String>();
-
-                if let Some(rest) = s.strip_suffix('%') {
-                    let Ok(x) = rest.parse::<usize>() else {
-                        return (0, Vec::new());
-                    };
-                    if x > 100 {
-                        return (0, Vec::new());
-                    }
-                    return (1, vec![x * (haystack.len() - 1) / 100]);
-                }
-
-                let Ok(x) = usize::from_str_radix(&s, 16) else {
-                    return (0, vec![]);
-                };
-
-                if x < haystack.len() {
-                    (1, vec![x])
-                } else {
-                    (0, Vec::new())
-                }
-            },
-        ),
-    };
+    let app = App::new(&buffer, args);
 
     // create app and run it
     let res = run_app(&mut terminal, app);
@@ -396,13 +255,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 }
 
 fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
-    let haystack = app.buffer.clone();
-    let alignment_bytes = app.alignment.bytes(app.cursor.1);
-    let search_alignment_bytes = if app.search_aligned {
-        alignment_bytes
-    } else {
-        1
-    };
+    let alignment_bytes = app.state.alignment.bytes(app.state.cursor.1);
 
     // We always allow quitting with ctrl+c
     if let Event::Key(KeyEvent {
@@ -415,185 +268,16 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
     }
 
     // The help popup takes precedence over everything else
-    if app.help_popup {
+    if app.state.help_popup {
         if let Event::Key(KeyEvent {
             code: KeyCode::Char('?' | 'q') | KeyCode::Esc | KeyCode::Enter,
             ..
         }) = event
         {
-            app.help_popup = false;
+            app.state.help_popup = false;
         }
         // We ignore everything until the popup is gone
         return ControlFlow::Continue(());
-    }
-
-    // Now we do our normal event handling
-    if let Event::Key(key) = event {
-        let shift = key.modifiers == KeyModifiers::SHIFT;
-        let control = key.modifiers == KeyModifiers::CONTROL;
-
-        match key.code {
-            KeyCode::Up if control => {
-                app.scroll(-1);
-            }
-            KeyCode::Up => {
-                app.move_cursor(-(app.bytes_per_line() as isize));
-            }
-            KeyCode::Down if control => {
-                app.scroll(1);
-            }
-            KeyCode::Down => {
-                app.move_cursor(app.bytes_per_line() as isize);
-            }
-            KeyCode::PageDown => {
-                app.scroll_and_move_cursor(app.lines_displayed() as isize);
-            }
-            KeyCode::PageUp => {
-                app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
-            }
-            KeyCode::Char('d') if control => {
-                app.scroll_and_move_cursor(app.lines_displayed() as isize);
-            }
-            KeyCode::Char('u') if control => {
-                app.scroll_and_move_cursor(-(app.lines_displayed() as isize));
-            }
-            KeyCode::Esc => {
-                app.current_search_buffer = None;
-            }
-            _ => {}
-        }
-
-        if let Some(buf) = app.current_buffer_mut() {
-            match key.code {
-                KeyCode::Right => {
-                    buf.cursor_position += 1;
-                    buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
-                }
-                KeyCode::Left => {
-                    buf.cursor_position = buf.cursor_position.saturating_sub(1);
-                }
-                // Only Shift can be pressed for a character to be recognized
-                KeyCode::Char(c) if shift || key.modifiers.is_empty() => {
-                    buf.buffer.insert(buf.cursor_position, c);
-                    buf.cursor_position += 1;
-                }
-                KeyCode::Home => {
-                    buf.cursor_position = 0;
-                }
-                KeyCode::End => {
-                    buf.cursor_position = buf.buffer.len();
-                }
-                // 'h' is backspace with control for inexplicable reasons
-                KeyCode::Backspace | KeyCode::Char('h') if control => {
-                    buf.buffer.clear();
-                    buf.cursor_position = 0;
-                }
-                KeyCode::Backspace if buf.cursor_position > 0 => {
-                    buf.buffer.remove(buf.cursor_position - 1);
-                    buf.cursor_position = buf.cursor_position.saturating_sub(1);
-                    buf.cursor_position = buf.cursor_position.min(buf.buffer.len());
-                }
-                KeyCode::Delete if buf.cursor_position < buf.buffer.len() => {
-                    buf.buffer.remove(buf.cursor_position);
-                }
-                KeyCode::Enter => {
-                    let action = buf.action.clone();
-                    (app.search_str_len, app.positions) =
-                        (action)(buf, &haystack, search_alignment_bytes);
-
-                    if !app.positions.is_empty() {
-                        let i = match app.positions.binary_search(&app.cursor.0) {
-                            Ok(i) | Err(i) => i,
-                        };
-                        let i = i % app.positions.len();
-                        app.occurrence = i + 1;
-                        app.set_cursor(app.positions[i], app.search_str_len)
-                    }
-                    app.current_search_buffer = None;
-                }
-                KeyCode::Char('a') if control => {
-                    app.search_aligned = !app.search_aligned;
-                }
-                _ => {}
-            }
-        }
-
-        // Vim-like controls when not typing in a buffer
-        if app.current_search_buffer.is_none() {
-            match key.code {
-                KeyCode::Right if shift => {
-                    app.cursor.1 += 1;
-                }
-                KeyCode::Right if control => {
-                    app.move_cursor(alignment_bytes as isize);
-                }
-                KeyCode::Right => {
-                    app.move_cursor(1);
-                }
-                KeyCode::Left if shift => {
-                    app.cursor.1 = app.cursor.1.saturating_sub(1).max(1);
-                }
-                KeyCode::Left if control => {
-                    app.move_cursor(-(alignment_bytes as isize));
-                }
-                KeyCode::Left => {
-                    app.move_cursor(-1);
-                }
-                KeyCode::Char('q') => {
-                    return ControlFlow::Break(());
-                }
-                KeyCode::Char('j') => {
-                    app.move_cursor(app.bytes_per_line() as isize);
-                }
-                KeyCode::Char('k') => {
-                    app.move_cursor(-(app.bytes_per_line() as isize));
-                }
-                KeyCode::Char('h') => {
-                    app.move_cursor(-1);
-                }
-                KeyCode::Char('l') => {
-                    app.move_cursor(1);
-                }
-                KeyCode::Char('g') => {
-                    app.current_search_buffer = Some(SearchBufferType::Goto);
-                }
-                KeyCode::Char('s') => {
-                    app.current_search_buffer = Some(SearchBufferType::AsciiSearch);
-                }
-                KeyCode::Char('/') => {
-                    app.current_search_buffer = Some(SearchBufferType::HexSearch);
-                }
-                KeyCode::Char('i') => {
-                    app.show_inspector = !app.show_inspector;
-                }
-                KeyCode::Char('?') => {
-                    app.help_popup = true;
-                }
-                KeyCode::Char(';') => {
-                    app.cursor.1 = 1;
-                }
-                KeyCode::Char('n' | 'N') | KeyCode::Enter if !app.positions.is_empty() => {
-                    let res = app.positions.binary_search(&app.cursor.0);
-                    let i = if shift {
-                        match res {
-                            Ok(i) | Err(i) => i + app.positions.len() - 1,
-                        }
-                    } else {
-                        match res {
-                            Ok(i) => i + 1,
-                            Err(i) => i,
-                        }
-                    };
-                    let i = i % app.positions.len();
-                    app.occurrence = i + 1;
-                    app.set_cursor(app.positions[i], app.search_str_len);
-                }
-                KeyCode::Char('a') if control => {
-                    app.alignment = app.alignment.next();
-                }
-                _ => {}
-            }
-        }
     }
 
     if let Event::Mouse(MouseEvent {
@@ -604,19 +288,144 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
     }) = event
     {
         match kind {
-            MouseEventKind::ScrollDown => app.scroll(1),
-            MouseEventKind::ScrollUp => app.scroll(-1),
+            MouseEventKind::ScrollDown => app.state.scroll(1),
+            MouseEventKind::ScrollUp => app.state.scroll(-1),
             MouseEventKind::Down(MouseButton::Left) => {
-                if app.hex_area.contains(Position::new(column, row)) {
-                    let x = (column - app.hex_area.x - 8) / 3;
-                    let y = row - app.hex_area.y;
-                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
+                if app.state.hex_area.contains(Position::new(column, row)) {
+                    let x = (column - app.state.hex_area.x - 8) / 3;
+                    let y = row - app.state.hex_area.y;
+                    app.state.set_cursor(
+                        app.state.view + y as usize * app.state.bytes_per_line() + x as usize,
+                        1,
+                    );
                 }
-                if app.ascii_area.contains(Position::new(column, row)) {
-                    let x = column - app.ascii_area.x;
-                    let y = row - app.ascii_area.y;
-                    app.set_cursor(app.view + y as usize * app.bytes_per_line() + x as usize, 1);
+                if app.state.ascii_area.contains(Position::new(column, row)) {
+                    let x = column - app.state.ascii_area.x;
+                    let y = row - app.state.ascii_area.y;
+                    app.state.set_cursor(
+                        app.state.view + y as usize * app.state.bytes_per_line() + x as usize,
+                        1,
+                    );
                 }
+            }
+            _ => {}
+        }
+    }
+
+    // Now we do our normal event handling
+    if let Event::Key(key) = event {
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+
+        match key.code {
+            KeyCode::Up if ctrl => {
+                app.state.scroll(-1);
+            }
+            KeyCode::Up => {
+                app.state
+                    .move_cursor(-(app.state.bytes_per_line() as isize));
+            }
+            KeyCode::Down if ctrl => {
+                app.state.scroll(1);
+            }
+            KeyCode::Down => {
+                app.state.move_cursor(app.state.bytes_per_line() as isize);
+            }
+            KeyCode::PageDown => {
+                app.state
+                    .scroll_and_move_cursor(app.state.lines_displayed() as isize);
+            }
+            KeyCode::PageUp => {
+                app.state
+                    .scroll_and_move_cursor(-(app.state.lines_displayed() as isize));
+            }
+            KeyCode::Char('d') if ctrl => {
+                app.state
+                    .scroll_and_move_cursor(app.state.lines_displayed() as isize);
+            }
+            KeyCode::Char('u') if ctrl => {
+                app.state
+                    .scroll_and_move_cursor(-(app.state.lines_displayed() as isize));
+            }
+            KeyCode::Char('s') if ctrl => app.state.endianness = app.state.endianness.flip(),
+            KeyCode::Esc => {
+                app.search.visible = false;
+                app.goto.visible = false;
+            }
+            _ => {}
+        }
+    }
+
+    if app.search.visible {
+        app.search.input(&mut app.state, event);
+        return ControlFlow::Continue(());
+    }
+
+    if app.goto.visible {
+        app.goto.input(&mut app.state, event);
+        return ControlFlow::Continue(());
+    }
+
+    // Vim-like controls when not typing in a buffer
+    if let Event::Key(key) = event {
+        let shift = key.modifiers == KeyModifiers::SHIFT;
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+
+        match key.code {
+            KeyCode::Right if shift => {
+                app.state.cursor.1 += 1;
+            }
+            KeyCode::Right if ctrl => {
+                app.state.move_cursor(alignment_bytes as isize);
+            }
+            KeyCode::Right => {
+                app.state.move_cursor(1);
+            }
+            KeyCode::Left if shift => {
+                app.state.cursor.1 = app.state.cursor.1.saturating_sub(1).max(1);
+            }
+            KeyCode::Left if ctrl => {
+                app.state.move_cursor(-(alignment_bytes as isize));
+            }
+            KeyCode::Left => {
+                app.state.move_cursor(-1);
+            }
+            KeyCode::Char('q') => {
+                return ControlFlow::Break(());
+            }
+            KeyCode::Char('j') => {
+                app.state.move_cursor(app.state.bytes_per_line() as isize);
+            }
+            KeyCode::Char('k') => {
+                app.state
+                    .move_cursor(-(app.state.bytes_per_line() as isize));
+            }
+            KeyCode::Char('h') => {
+                app.state.move_cursor(-1);
+            }
+            KeyCode::Char('l') => {
+                app.state.move_cursor(1);
+            }
+            KeyCode::Char('g') => {
+                app.goto.visible = true;
+            }
+            KeyCode::Char('f') if ctrl => {
+                app.search.visible = true;
+            }
+            KeyCode::Char('/') => {
+                app.search.visible = true;
+            }
+            KeyCode::Char('i') => {
+                app.state.show_inspector = !app.state.show_inspector;
+            }
+            KeyCode::Char('?') => {
+                app.state.help_popup = true;
+            }
+            KeyCode::Char(';') => {
+                app.state.cursor.1 = 1;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Enter => app.state.goto_occurrence(shift),
+            KeyCode::Char('a') if ctrl => {
+                app.state.alignment = app.state.alignment.next();
             }
             _ => {}
         }
@@ -626,29 +435,30 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
 }
 
 fn ui(app: &mut App, frame: &mut Frame) {
-    let size = match app.buffer.len() {
+    let size = match app.state.buffer.len() {
         s if s < 1024 => format!("{s} B"),
         s if s < 1024usize.pow(2) => format!("{:.1} KB", s as f64 / 1024.0),
         s if s < 1024usize.pow(3) => format!("{:.1} MB", s as f64 / 1024.0f64.powf(2.0)),
         s => format!("{:.1} GB", s as f64 / 1024.0f64.powf(3.0)),
     };
-    let offset = app.cursor.0;
-    let percentage = (offset as f64 * 100.0) / app.buffer.len() as f64;
+    let offset = app.state.cursor.0;
+    let percentage = (offset as f64 * 100.0) / app.state.buffer.len() as f64;
     let main_block = Block::new().title_bottom(format!(
         "Press `?` for help. Viewing: {}, file size: {size} ({offset:0>8x}, {percentage:.2}%), Occurrence: {}/{}",
-        app.path.display(),
-        app.occurrence,
-        app.positions.len(),
+        app.state.path.display(),
+        app.state.occurrence,
+        app.state.occurrence_positions.len(),
     ));
 
-    let spacing = app.spacing as usize;
+    let spacing = app.state.spacing as usize;
     let hex_width = 2 // borders
         + 8 // offset
         + 2 * spacing // padding of block
-        + 2 * spacing * app.groups // padding of columns 
-        + (3 * app.bytes_per_group * app.groups); // bytes
+        + 2 * spacing * app.state.groups // padding of columns 
+        + (3 * app.state.bytes_per_group * app.state.groups); // bytes
 
-    let ascii_width = 2 + (app.bytes_per_group * app.groups) + if app.spacing { 2 } else { 0 };
+    let ascii_width =
+        2 + (app.state.bytes_per_group * app.state.groups) + if app.state.spacing { 2 } else { 0 };
     let width = hex_width + ascii_width + 1; // scrollbar
 
     let frame_size = frame.size();
@@ -657,50 +467,31 @@ fn ui(app: &mut App, frame: &mut Frame) {
     let mut main = main_block.inner(frame_size);
     main.width = main.width.min(width as u16);
 
-    let [top_area, bottom_area, inspector_area] = Layout::vertical([
+    let [top_area, search_area, goto_area, inspector_area] = Layout::vertical([
         Min(0),
-        Length(if app.current_search_buffer.is_some() {
-            3
-        } else {
-            0
-        }),
-        Length(if app.show_inspector { 7 } else { 0 }),
+        Length(app.search.height()),
+        Length(app.goto.height()),
+        Length(if app.state.show_inspector { 7 } else { 0 }),
     ])
     .areas(main);
 
-    if let Some(buf) = &app.current_buffer() {
-        let aligned = "Ctrl+A: Search Aligned";
-        let popup_block = Block::bordered()
-            .title(buf.name)
-            .title_bottom(if app.search_aligned {
-                aligned.bg(Color::Green).fg(Color::Black)
-            } else {
-                aligned.into()
-            })
-            .padding(Padding::horizontal(1));
-
-        frame.render_widget(&popup_block, bottom_area);
-        let search_area = popup_block.inner(bottom_area);
-        let s = buf.buffer.iter().collect::<String>();
-        let text = Paragraph::new(Text::from(if s.is_empty() {
-            buf.placeholder_text.fg(Color::DarkGray)
-        } else {
-            s.into()
-        }));
-        frame.render_widget(&text, search_area);
-        let x = search_area.x + buf.cursor_position as u16;
-        frame.set_cursor(x, search_area.y);
+    if app.search.visible {
+        frame.render_widget(&app.search, search_area)
     }
 
-    if app.show_inspector {
+    if app.goto.visible {
+        frame.render_widget(&app.goto, goto_area)
+    }
+
+    if app.state.show_inspector {
         let inspector_block = Block::bordered().title("Inspector (press `I` to hide)");
 
-        let offset = app.cursor.0;
-        let x = app.buffer[offset];
-        let x8 = u8::from_le_bytes(chunk(&app.buffer, offset));
-        let x16 = u16::from_le_bytes(chunk(&app.buffer, offset));
-        let x32 = u32::from_le_bytes(chunk(&app.buffer, offset));
-        let x64 = u64::from_le_bytes(chunk(&app.buffer, offset));
+        let offset = app.state.cursor.0;
+        let x = app.state.buffer[offset];
+        let x8 = u8::from_le_bytes(chunk(app.state.buffer, offset));
+        let x16 = u16::from_le_bytes(chunk(app.state.buffer, offset));
+        let x32 = u32::from_le_bytes(chunk(app.state.buffer, offset));
+        let x64 = u64::from_le_bytes(chunk(app.state.buffer, offset));
 
         let inspector_text = Paragraph::new(vec![
             Line::from(format!(
@@ -733,9 +524,10 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     let block = Block::new()
         .title("HEX")
-        .padding(Padding::uniform(if app.spacing { 1 } else { 0 }))
+        .padding(Padding::uniform(if app.state.spacing { 1 } else { 0 }))
         .borders(Borders::ALL)
-        .title_bottom(format!("Align: {}", app.alignment).fg(Color::White))
+        .title_bottom(format!(" Align: {} ", app.state.alignment).fg(Color::White))
+        .title_bottom(format!(" {}-endian ", app.state.endianness).fg(Color::White))
         .border_style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(&block, hex_area);
@@ -743,7 +535,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     let block = Block::new()
         .title("ASCII")
-        .padding(Padding::uniform(if app.spacing { 1 } else { 0 }))
+        .padding(Padding::uniform(if app.state.spacing { 1 } else { 0 }))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -751,12 +543,12 @@ fn ui(app: &mut App, frame: &mut Frame) {
     let ascii_area = block.inner(ascii_area);
 
     // Store the rects to properly handle mouse input
-    app.hex_area = hex_area;
-    app.ascii_area = ascii_area;
+    app.state.hex_area = hex_area;
+    app.state.ascii_area = ascii_area;
 
     let lines_to_draw = hex_area.height as usize;
 
-    let mut scrollbar_state = ScrollbarState::new(app.buffer.len())
+    let mut scrollbar_state = ScrollbarState::new(app.state.buffer.len())
         .position(offset)
         .viewport_content_length(lines_to_draw);
     frame.render_stateful_widget(
@@ -767,7 +559,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     let mut lines = Vec::new();
     'outer: for i in 0..lines_to_draw {
-        let line_offset = app.view + i * app.bytes_per_line();
+        let line_offset = app.state.view + i * app.state.bytes_per_line();
 
         // Write the offset at the start of the line
         let mut spans = Vec::new();
@@ -778,9 +570,9 @@ fn ui(app: &mut App, frame: &mut Frame) {
         ));
         spans.push(Span::raw(offset_string));
 
-        for byte_offset in line_offset..(line_offset + app.bytes_per_line()) {
-            if byte_offset % app.bytes_per_group == 0 {
-                if app.spacing {
+        for byte_offset in line_offset..(line_offset + app.state.bytes_per_line()) {
+            if byte_offset % app.state.bytes_per_group == 0 {
+                if app.state.spacing {
                     spans.push(" │ ".fg(Color::DarkGray));
                 } else {
                     spans.push("│".fg(Color::DarkGray));
@@ -788,8 +580,8 @@ fn ui(app: &mut App, frame: &mut Frame) {
             } else {
                 spans.push(Span::raw(" "));
             }
-            match app.buffer.get(byte_offset) {
-                Some(byte) => spans.push(write_byte(app, byte_offset, *byte)),
+            match app.state.buffer.get(byte_offset) {
+                Some(byte) => spans.push(write_byte(&app.state, byte_offset, *byte)),
                 None => {
                     lines.push(Line::from(spans));
                     break 'outer;
@@ -805,12 +597,12 @@ fn ui(app: &mut App, frame: &mut Frame) {
     let mut lines = Vec::new();
     'outer: for i in 0..lines_to_draw {
         // Write the offset at the start of the line
-        let line_offset = app.view + i * app.bytes_per_line();
+        let line_offset = app.state.view + i * app.state.bytes_per_line();
 
         let mut spans = Vec::new();
-        for byte_offset in line_offset..(line_offset + app.bytes_per_line()) {
-            match app.buffer.get(byte_offset) {
-                Some(byte) => spans.push(render_ascii_char(app, byte_offset, *byte)),
+        for byte_offset in line_offset..(line_offset + app.state.bytes_per_line()) {
+            match app.state.buffer.get(byte_offset) {
+                Some(byte) => spans.push(render_ascii_char(&app.state, byte_offset, *byte)),
                 None => {
                     lines.push(Line::from(spans));
                     break 'outer;
@@ -823,7 +615,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     frame.render_widget(Paragraph::new(Text::from(lines)), ascii_area);
 
-    if app.help_popup {
+    if app.state.help_popup {
         let help_block = Block::bordered().title("Help (press `q` or `?` to dismiss)");
         let area = centered_rect(60, 30, frame_size);
         frame.render_widget(Clear, area);
@@ -905,41 +697,41 @@ fn byte_color(byte: u8) -> Color {
     }
 }
 
-fn style_for_byte(app: &App, offset: usize, byte: u8) -> Style {
+fn style_for_byte(state: &AppState, offset: usize, byte: u8) -> Style {
     let mut style = Style::default();
 
-    if (app.cursor.0..(app.cursor.0 + app.cursor.1)).contains(&offset) {
+    if (state.cursor.0..(state.cursor.0 + state.cursor.1)).contains(&offset) {
         style = style.black().on_white().bold().underlined();
-    } else if !app.positions.is_empty() {
-        let i = match app.positions.binary_search(&offset) {
+    } else if !state.occurrence_positions.is_empty() {
+        let i = match state.occurrence_positions.binary_search(&offset) {
             Ok(i) => i,
-            Err(i) => (i + app.positions.len() - 1) % app.positions.len(),
+            Err(i) => (i + state.occurrence_positions.len() - 1) % state.occurrence_positions.len(),
         };
-        let pos = app.positions[i];
-        if (pos..(pos + app.search_str_len)).contains(&offset) {
+        let pos = state.occurrence_positions[i];
+        if (pos..(pos + state.searched.len())).contains(&offset) {
             style = style.white().on_blue();
         }
     }
-    if app.color && style.fg.is_none() {
+    if state.color && style.fg.is_none() {
         style = style.fg(byte_color(byte));
     }
     style
 }
 
-fn write_byte(app: &App, offset: usize, byte: u8) -> Span<'static> {
+fn write_byte(state: &AppState, offset: usize, byte: u8) -> Span<'static> {
     let s = format!("{:0>2x}", byte);
-    let style = style_for_byte(app, offset, byte);
+    let style = style_for_byte(state, offset, byte);
     Span::styled(s, style)
 }
 
-fn render_ascii_char(app: &App, offset: usize, byte: u8) -> Span<'static> {
+fn render_ascii_char(state: &AppState, offset: usize, byte: u8) -> Span<'static> {
     let c = match byte {
         0..=31 => '.',
         byte @ (b' '..=b'~') => byte as char,
         127 => '.',
         128..=u8::MAX => '.',
     };
-    let style = style_for_byte(app, offset, byte);
+    let style = style_for_byte(state, offset, byte);
     Span::styled(String::from(c), style)
 }
 
