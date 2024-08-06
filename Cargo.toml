@@ -1,6 +1,6 @@
 [package]
 name = "hexview"
-version = "0.4.0"
+version = "0.5.0"
 authors = ["Terts Diepraam"]
 edition = "2021"
 rust-version = "1.78"
