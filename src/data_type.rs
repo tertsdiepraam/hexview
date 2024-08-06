@@ -23,7 +23,7 @@ impl Display for Repr {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Endianness {
     #[default]
     Big,
@@ -76,4 +76,3 @@ impl DataType for u32 {
         }
     }
 }
-

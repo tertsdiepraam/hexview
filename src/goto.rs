@@ -44,7 +44,7 @@ impl Goto {
             if x > 100 {
                 return;
             }
-            state.set_cursor(x * (state.buffer.len() - 1) / 100, state.cursor.1);
+            state.set_cursor(x * (state.buffer.len() - 1) / 100, state.cursor.length);
         }
 
         let Ok(x) = usize::from_str_radix(&line, 16) else {
@@ -52,7 +52,7 @@ impl Goto {
         };
 
         if x < state.buffer.len() {
-            state.set_cursor(x, state.cursor.1);
+            state.set_cursor(x, state.cursor.length);
         }
     }
 }

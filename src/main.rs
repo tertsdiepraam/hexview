@@ -1,5 +1,10 @@
 use std::{
-    error::Error, io::{self, Read}, num::NonZeroUsize, ops::ControlFlow, path::PathBuf, time::Duration
+    error::Error,
+    io::{self, Read},
+    num::NonZeroUsize,
+    ops::ControlFlow,
+    path::PathBuf,
+    time::Duration,
 };
 
 use alignment::Alignment;
@@ -47,8 +52,9 @@ pub struct Args {
     #[arg(short, long, default_value_t = 2)]
     /// The number of groups (columns) to show
     groups: usize,
-    #[arg(short, long, default_value_t = true)]
-    color: bool,
+    /// Disable colored output
+    #[arg(short, long)]
+    no_color: bool,
     /// Add a bit of additional padding
     #[arg(short, long, default_value_t = false)]
     spacing: bool,
@@ -64,19 +70,31 @@ pub struct AppState<'a> {
     color: bool,
     /// Position and length of the cursor
     cursor: Cursor,
+    /// Bytes of the file
     buffer: &'a [u8],
+    /// Path of the file we're looking at
     path: PathBuf,
+    /// Search string
     searched: Vec<u8>,
     /// Last occurrence we jumped to
     occurrence: usize,
+    /// All occurrences of the searched string
     occurrence_positions: Vec<usize>,
+    /// The alignment settings
     alignment: Alignment,
+    /// Whether the help popup is shown
     help_popup: bool,
+    /// Whether the inspector is shown
     show_inspector: bool,
+    /// How many bytes are displayed per group
     bytes_per_group: usize,
+    /// How many groups are displayed
     groups: usize,
+    /// The endianness of the data for searching
     endianness: Endianness,
+    /// Area where the hex view was last drawn
     hex_area: Rect,
+    /// Area where the ASCII view was last drawn
     ascii_area: Rect,
 }
 
@@ -101,13 +119,25 @@ impl Default for Cursor {
     }
 }
 
+impl Cursor {
+    fn range(&self) -> std::ops::Range<usize> {
+        let start = self.position;
+        let end = self.position + self.length.get();
+        start..end
+    }
+
+    fn contains(&self, offset: usize) -> bool {
+        self.range().contains(&offset)
+    }
+}
+
 impl<'a> App<'a> {
     fn new(buffer: &'a [u8], args: Args) -> Self {
         let Args {
             file: path,
             bytes: bytes_per_group,
             groups,
-            color,
+            no_color,
             spacing,
         } = args;
         App {
@@ -115,10 +145,9 @@ impl<'a> App<'a> {
                 path,
                 buffer,
                 spacing,
-                color,
+                color: !no_color,
                 bytes_per_group,
                 groups,
-                cursor: (0, 1),
                 ..Default::default()
             },
             ..Default::default()
@@ -128,13 +157,18 @@ impl<'a> App<'a> {
 
 impl AppState<'_> {
     fn move_cursor(&mut self, delta: isize) {
-        let offset = self.cursor.0.saturating_add_signed(delta);
-        self.set_cursor(offset, self.cursor.1)
+        let offset = self.cursor.position.saturating_add_signed(delta);
+        self.set_cursor(offset, self.cursor.length)
     }
 
-    fn set_cursor(&mut self, offset: usize, len: usize) {
+    fn extend_cursor(&mut self, delta: isize) {
+        let length = self.cursor.length.get().saturating_add_signed(delta);
+        self.cursor.length = NonZeroUsize::new(length).unwrap_or(NonZeroUsize::MIN);
+    }
+
+    fn set_cursor(&mut self, offset: usize, length: NonZeroUsize) {
         let position = offset.min(self.buffer.len() - 1);
-        self.cursor = (position, len);
+        self.cursor = Cursor { position, length };
         self.scroll_to_cursor();
     }
 
@@ -162,9 +196,9 @@ impl AppState<'_> {
     }
 
     fn scroll_to_cursor(&mut self) {
-        let start = self.cursor.0;
-        let end = start + self.cursor.1;
-        if self.cursor.0 < self.view {
+        let start = self.cursor.position;
+        let end = self.cursor.length.get().saturating_add(start);
+        if self.cursor.position < self.view {
             self.view = self.line_offset(start);
         } else if end >= self.view + (self.bytes_per_line() * self.lines_displayed()) {
             self.view =
@@ -174,7 +208,9 @@ impl AppState<'_> {
 
     fn goto_occurrence(&mut self, previous: bool) {
         if !self.occurrence_positions.is_empty() {
-            let res = self.occurrence_positions.binary_search(&self.cursor.0);
+            let res = self
+                .occurrence_positions
+                .binary_search(&self.cursor.position);
             let i = if previous {
                 match res {
                     Ok(i) | Err(i) => i + self.occurrence_positions.len() - 1,
@@ -187,7 +223,10 @@ impl AppState<'_> {
             };
             let i = i % self.occurrence_positions.len();
             self.occurrence = i + 1;
-            self.set_cursor(self.occurrence_positions[i], self.searched.len());
+            self.set_cursor(
+                self.occurrence_positions[i],
+                NonZeroUsize::try_from(self.searched.len()).unwrap(),
+            );
         }
     }
 
@@ -255,7 +294,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 }
 
 fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
-    let alignment_bytes = app.state.alignment.bytes(app.state.cursor.1);
+    let alignment_bytes = app.state.alignment.bytes(app.state.cursor.length.get());
 
     // We always allow quitting with ctrl+c
     if let Event::Key(KeyEvent {
@@ -296,7 +335,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
                     let y = row - app.state.hex_area.y;
                     app.state.set_cursor(
                         app.state.view + y as usize * app.state.bytes_per_line() + x as usize,
-                        1,
+                        NonZeroUsize::new(1).unwrap(),
                     );
                 }
                 if app.state.ascii_area.contains(Position::new(column, row)) {
@@ -304,7 +343,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
                     let y = row - app.state.ascii_area.y;
                     app.state.set_cursor(
                         app.state.view + y as usize * app.state.bytes_per_line() + x as usize,
-                        1,
+                        NonZeroUsize::new(1).unwrap(),
                     );
                 }
             }
@@ -372,7 +411,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
 
         match key.code {
             KeyCode::Right if shift => {
-                app.state.cursor.1 += 1;
+                app.state.extend_cursor(1);
             }
             KeyCode::Right if ctrl => {
                 app.state.move_cursor(alignment_bytes as isize);
@@ -381,7 +420,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
                 app.state.move_cursor(1);
             }
             KeyCode::Left if shift => {
-                app.state.cursor.1 = app.state.cursor.1.saturating_sub(1).max(1);
+                app.state.extend_cursor(-1);
             }
             KeyCode::Left if ctrl => {
                 app.state.move_cursor(-(alignment_bytes as isize));
@@ -421,7 +460,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
                 app.state.help_popup = true;
             }
             KeyCode::Char(';') => {
-                app.state.cursor.1 = 1;
+                app.state.cursor.length = NonZeroUsize::new(1).unwrap();
             }
             KeyCode::Char('n' | 'N') | KeyCode::Enter => app.state.goto_occurrence(shift),
             KeyCode::Char('a') if ctrl => {
@@ -441,7 +480,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
         s if s < 1024usize.pow(3) => format!("{:.1} MB", s as f64 / 1024.0f64.powf(2.0)),
         s => format!("{:.1} GB", s as f64 / 1024.0f64.powf(3.0)),
     };
-    let offset = app.state.cursor.0;
+    let offset = app.state.cursor.position;
     let percentage = (offset as f64 * 100.0) / app.state.buffer.len() as f64;
     let main_block = Block::new().title_bottom(format!(
         "Press `?` for help. Viewing: {}, file size: {size} ({offset:0>8x}, {percentage:.2}%), Occurrence: {}/{}",
@@ -486,12 +525,23 @@ fn ui(app: &mut App, frame: &mut Frame) {
     if app.state.show_inspector {
         let inspector_block = Block::bordered().title("Inspector (press `I` to hide)");
 
-        let offset = app.state.cursor.0;
+        let offset = app.state.cursor.position;
         let x = app.state.buffer[offset];
-        let x8 = u8::from_le_bytes(chunk(app.state.buffer, offset));
-        let x16 = u16::from_le_bytes(chunk(app.state.buffer, offset));
-        let x32 = u32::from_le_bytes(chunk(app.state.buffer, offset));
-        let x64 = u64::from_le_bytes(chunk(app.state.buffer, offset));
+        let (x8, x16, x32, x64) = if app.state.endianness == Endianness::Little {
+            (
+                u8::from_le_bytes(chunk(app.state.buffer, offset)),
+                u16::from_le_bytes(chunk(app.state.buffer, offset)),
+                u32::from_le_bytes(chunk(app.state.buffer, offset)),
+                u64::from_le_bytes(chunk(app.state.buffer, offset)),
+            )
+        } else {
+            (
+                u8::from_be_bytes(chunk(app.state.buffer, offset)),
+                u16::from_be_bytes(chunk(app.state.buffer, offset)),
+                u32::from_be_bytes(chunk(app.state.buffer, offset)),
+                u64::from_be_bytes(chunk(app.state.buffer, offset)),
+            )
+        };
 
         let inspector_text = Paragraph::new(vec![
             Line::from(format!(
@@ -700,7 +750,7 @@ fn byte_color(byte: u8) -> Color {
 fn style_for_byte(state: &AppState, offset: usize, byte: u8) -> Style {
     let mut style = Style::default();
 
-    if (state.cursor.0..(state.cursor.0 + state.cursor.1)).contains(&offset) {
+    if state.cursor.contains(offset) {
         style = style.black().on_white().bold().underlined();
     } else if !state.occurrence_positions.is_empty() {
         let i = match state.occurrence_positions.binary_search(&offset) {

@@ -56,11 +56,12 @@ impl Search {
 
         // Don't search again if we already have the results
         if bytes == state.searched {
+            state.goto_occurrence(false);
             return;
         }
 
         let alignment_bytes = if self.search_aligned {
-            state.alignment.bytes(state.cursor.1)
+            state.alignment.bytes(state.cursor.length.get())
         } else {
             1
         };
