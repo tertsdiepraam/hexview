@@ -60,6 +60,44 @@ pub struct Args {
     spacing: bool,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Format {
+    #[default]
+    LowerHex,
+    UpperHex,
+    Octal,
+    Binary,
+}
+
+impl Format {
+    fn next(self) -> Self {
+        use Format::*;
+        match self {
+            LowerHex => UpperHex,
+            UpperHex => Octal,
+            Octal => Binary,
+            Binary => LowerHex,
+        }
+    }
+
+    fn width(self) -> usize {
+        match self {
+            Format::LowerHex | Format::UpperHex => 2,
+            Format::Octal => 3,
+            Format::Binary => 8,
+        }
+    }
+
+    fn format_byte(self, byte: u8) -> String {
+        match self {
+            Format::LowerHex => format!("{byte:0>2x}"),
+            Format::UpperHex => format!("{byte:0>2X}"),
+            Format::Octal => format!("{byte:0>3o}"),
+            Format::Binary => format!("{byte:0>8b}"),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AppState<'a> {
     /// Offset of the byte in the top-left corner
@@ -96,6 +134,8 @@ pub struct AppState<'a> {
     hex_area: Rect,
     /// Area where the ASCII view was last drawn
     ascii_area: Rect,
+    /// Format to view
+    format: Format,
 }
 
 #[derive(Default)]
@@ -466,6 +506,7 @@ fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
             KeyCode::Char('a') if ctrl => {
                 app.state.alignment = app.state.alignment.next();
             }
+            KeyCode::Char('o') => app.state.format = app.state.format.next(),
             _ => {}
         }
     }
@@ -494,7 +535,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
         + 8 // offset
         + 2 * spacing // padding of block
         + 2 * spacing * app.state.groups // padding of columns 
-        + (3 * app.state.bytes_per_group * app.state.groups); // bytes
+        + ((1 + app.state.format.width()) * app.state.bytes_per_group * app.state.groups); // bytes
 
     let ascii_width =
         2 + (app.state.bytes_per_group * app.state.groups) + if app.state.spacing { 2 } else { 0 };
@@ -666,28 +707,28 @@ fn ui(app: &mut App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(Text::from(lines)), ascii_area);
 
     if app.state.help_popup {
-        let help_block = Block::bordered().title("Help (press `q` or `?` to dismiss)");
-        let area = centered_rect(60, 30, frame_size);
+        let help_block = Block::bordered().title(" Help (press `q` or `?` to dismiss) ");
+        let area = centered_rect(70,40, frame_size);
         frame.render_widget(Clear, area);
         let area = area.inner(Margin::new(1, 1));
         frame.render_widget(&help_block, area);
 
         let keys = vec![
+            (vec![], "General"),
             (vec!["?"], "Toggle help"),
+            (vec!["G"], "Goto offset"),
+            (vec!["CTRL+F", "/"], "Search string"),
+            (vec!["I"], "Toggle inspector"),
+            (vec!["O"], "Change format"),
             (vec!["Q", "CTRL+C"], "Quit"),
+            (vec![], ""),
+            (vec![], "Movement"),
             (vec!["UP", "K"], "Move cursor up"),
             (vec!["DOWN", "J"], "Move cursor down"),
             (vec!["LEFT", "H"], "Move cursor left"),
             (vec!["RIGHT", "L"], "Move cursor right"),
             (vec!["PAGE UP", "CTRL+U"], "Page up"),
             (vec!["PAGE DOWN", "CTRL+D"], "Page down"),
-            (vec!["G"], "Goto offset"),
-            (vec!["S"], "Search ASCII string"),
-            (vec!["/"], "Search HEX string"),
-            (vec!["ENTER"], "Confirm search"),
-            (vec!["N"], "Next search occurrence"),
-            (vec!["SHIFT+N"], "Previous search occurrence"),
-            (vec!["I"], "Toggle inspector"),
             (vec!["CTRL+A"], "Change alignment"),
             (vec!["CTRL+LEFT"], "Move cursor left by alignment"),
             (vec!["CTRL+RIGHT"], "Move cursor right by alignment"),
@@ -696,10 +737,18 @@ fn ui(app: &mut App, frame: &mut Frame) {
             (vec!["SHIFT+RIGHT"], "Extend cursor"),
             (vec!["SHIFT+LEFT"], "Shrink cursor"),
             (vec![";"], "Collapse cursor to 1 byte"),
+            (vec![], ""),
+            (vec![], "Seaching"),
+            (vec!["ENTER"], "Confirm search"),
+            (vec!["N"], "Next search occurrence"),
+            (vec!["SHIFT+N"], "Previous search occurrence"),
         ];
 
         let table = Table::new(
             keys.iter().map(|(keys, action)| {
+                if keys.is_empty() {
+                    return Row::new(vec![Line::from(*action)]);
+                }
                 let mut key_line = vec![keys[0].bold()];
                 for key in &keys[1..] {
                     key_line.push(", ".into());
@@ -769,7 +818,7 @@ fn style_for_byte(state: &AppState, offset: usize, byte: u8) -> Style {
 }
 
 fn write_byte(state: &AppState, offset: usize, byte: u8) -> Span<'static> {
-    let s = format!("{:0>2x}", byte);
+    let s = state.format.format_byte(byte);
     let style = style_for_byte(state, offset, byte);
     Span::styled(s, style)
 }
