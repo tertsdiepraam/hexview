@@ -15,8 +15,8 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     crossterm::{
         event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-            MouseButton, MouseEvent, MouseEventKind,
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+            KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
         },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -152,7 +152,7 @@ struct Cursor {
 
 impl Default for Cursor {
     fn default() -> Self {
-        Cursor {
+        Self {
             position: 0,
             length: 1.try_into().unwrap(),
         }
@@ -335,6 +335,14 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
 
 fn handle_event(app: &mut App, event: Event) -> ControlFlow<(), ()> {
     let alignment_bytes = app.state.alignment.bytes(app.state.cursor.length.get());
+
+    if let Event::Key(KeyEvent {
+        kind: KeyEventKind::Release,
+        ..
+    }) = event
+    {
+        return ControlFlow::Continue(());
+    }
 
     // We always allow quitting with ctrl+c
     if let Event::Key(KeyEvent {
@@ -598,8 +606,8 @@ fn ui(app: &mut App, frame: &mut Frame) {
                 "i8: {}, i16: {}, i32: {}, i64: {}",
                 x8 as i8, x16 as i16, x32 as i32, x64 as i64
             )),
-            Line::from(format!("f32: {}", f32::from_bits(x32),)),
-            Line::from(format!("f64: {}", f64::from_bits(x64),)),
+            Line::from(format!("f32: {:e}", f32::from_bits(x32),)),
+            Line::from(format!("f64: {:e}", f64::from_bits(x64),)),
         ]);
         frame.render_widget(&inspector_block, inspector_area);
         frame.render_widget(&inspector_text, inspector_block.inner(inspector_area));
@@ -708,7 +716,7 @@ fn ui(app: &mut App, frame: &mut Frame) {
 
     if app.state.help_popup {
         let help_block = Block::bordered().title(" Help (press `q` or `?` to dismiss) ");
-        let area = centered_rect(70,40, frame_size);
+        let area = centered_rect(70, 40, frame_size);
         frame.render_widget(Clear, area);
         let area = area.inner(Margin::new(1, 1));
         frame.render_widget(&help_block, area);
